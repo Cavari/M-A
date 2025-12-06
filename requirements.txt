@@ -1,2 +1,1 @@
-streamlit
-pandas
+pip install streamlit pandas beautifulsoup4 requests sentence-transformers google-generativeai
