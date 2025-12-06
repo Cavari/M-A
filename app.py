@@ -1,119 +1,157 @@
 import streamlit as st
 import pandas as pd
-import time
-from datetime import datetime
+import requests
+from bs4 import BeautifulSoup
+import google.generativeai as genai
+from sentence_transformers import SentenceTransformer, util
 
-# --- CONFIGURATION & SETUP ---
-st.set_page_config(page_title="M&A Deal Profiler", layout="wide", page_icon="🧩")
+# --- CONFIGURATION ---
+st.set_page_config(page_title="M&A Deal Profiler (Gemini Powered)", layout="wide", page_icon="🧩")
 
-# Mock Database (simulating what you'd have in a real SQL DB)
-MOCK_DB = [
-    {"Name": "Vista Equity", "Type": "PE Firm", "Focus": "Enterprise Software", "Min_Rev": 10, "Past_Buys": ["Mindbody", "Apptio"]},
-    {"Name": "Constellation Software", "Type": "Holding Co", "Focus": "Vertical Market SaaS", "Min_Rev": 2, "Past_Buys": ["Topicus", "Vela"]},
-    {"Name": "Salesforce Ventures", "Type": "Strategic", "Focus": "Cloud CRM & AI", "Min_Rev": 5, "Past_Buys": ["Slack", "Tableau"]},
-    {"Name": "DentalCorp", "Type": "Strategic", "Focus": "Healthcare/Dental", "Min_Rev": 1, "Past_Buys": ["Dental Care Alliance"]},
-    {"Name": "Thoma Bravo", "Type": "PE Firm", "Focus": "Security & Infrastructure", "Min_Rev": 20, "Past_Buys": ["Proofpoint", "Sophos"]}
+# 1. Load Local Embedding Model (Keeps vector search fast & free)
+@st.cache_resource
+def load_embedding_model():
+    return SentenceTransformer('all-MiniLM-L6-v2')
+
+embedding_model = load_embedding_model()
+
+# 2. Mock Database of Acquirers (In reality, this is your SQL DB)
+ACQUIRERS_DB = [
+    {"Name": "Vista Equity", "Type": "PE Firm", "Focus": "Enterprise Software, SaaS, Recurring Revenue", "Min_Rev": 10},
+    {"Name": "Salesforce Ventures", "Type": "Strategic", "Focus": "Cloud CRM, AI, B2B Marketing", "Min_Rev": 5},
+    {"Name": "Constellation Software", "Type": "Holding Co", "Focus": "Niche Vertical SaaS, Transit, Utilities", "Min_Rev": 2},
+    {"Name": "DentalCorp", "Type": "Strategic", "Focus": "Dental Practices, Medical Billing", "Min_Rev": 1},
+    {"Name": "Blackstone Growth", "Type": "PE Firm", "Focus": "Consumer Tech, content, logistics", "Min_Rev": 50},
 ]
 
 # --- HELPER FUNCTIONS ---
-def mock_ai_analysis(url):
-    """Simulates AI analyzing a website."""
-    time.sleep(2) # Simulate processing time
-    if "dental" in url.lower():
-        return "SaaS platform for dental practice management and patient scheduling."
-    elif "tech" in url.lower():
-        return "B2B Enterprise software for supply chain logistics."
-    else:
-        return "Cloud-based subscription software for small business inventory management."
 
-def match_acquirers(revenue, deal_type, business_summary):
-    """Simulates the matching logic."""
-    matches = []
-    
-    # Simple logic to simulate "AI Matching"
-    rev_amount = int(revenue.replace("$", "").replace("M", "").split("-")[0].replace("<", "").replace("+", ""))
-    
-    for buyer in MOCK_DB:
-        score = 0
-        # Revenue Logic
-        if rev_amount >= buyer["Min_Rev"]:
-            score += 30
+def scrape_website(url):
+    """Scrapes text from the given URL."""
+    try:
+        if not url.startswith('http'):
+            url = 'https://' + url
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        response = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(response.content, 'html.parser')
         
-        # Keyword Logic
-        if "Dental" in buyer["Focus"] and "dental" in business_summary.lower():
-            score += 50
-        if "Software" in buyer["Focus"] and "software" in business_summary.lower():
-            score += 40
+        # Get title and paragraphs
+        text = soup.title.string + " " if soup.title else ""
+        for p in soup.find_all('p'):
+            text += p.get_text() + " "
             
-        # Randomizer for "AI Confidence" feel
-        import random
-        score += random.randint(5, 15)
+        return text[:10000] # Gemini has a large context window, but let's limit to 10k chars for speed
+    except Exception as e:
+        return None
+
+def analyze_with_gemini(api_key, text):
+    """Uses Google Gemini to summarize the business."""
+    try:
+        genai.configure(api_key=api_key)
+        # Use 'gemini-1.5-flash' for speed and low cost
+        model = genai.GenerativeModel('gemini-1.5-flash')
         
-        if score > 40:
-            matches.append({**buyer, "Score": score})
+        prompt = f"""
+        You are an M&A analyst. Analyze the following website text for a target company.
+        
+        1. Summarize what the company does in 2 sentences.
+        2. Identify their primary industry/sector.
+        3. Identify their likely business model (SaaS, Service, Manufacturing, Marketplace).
+        
+        Website Text:
+        {text}
+        """
+        
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"Error connecting to Gemini: {e}"
+
+def find_matches(target_description, deal_type, revenue):
+    """Matches the AI summary against the Database using Vector Search."""
+    results = []
+    
+    # Encode the Target Description
+    target_embedding = embedding_model.encode(target_description, convert_to_tensor=True)
+    
+    for buyer in ACQUIRERS_DB:
+        # Encode Buyer Focus
+        buyer_text = f"{buyer['Focus']} interested in {buyer['Type']}"
+        buyer_embedding = embedding_model.encode(buyer_text, convert_to_tensor=True)
+        
+        # Calculate Similarity
+        score = util.pytorch_cos_sim(target_embedding, buyer_embedding).item()
+        
+        # Basic Filter: Don't show PE firms for tiny revenue
+        rev_val = 0
+        if "1M" in revenue: rev_val = 1
+        elif "5M" in revenue: rev_val = 5
+        elif "20M" in revenue: rev_val = 20
+        
+        if buyer['Min_Rev'] > rev_val and deal_type != "Distressed Asset":
+            score = score - 0.2 # Penalize mismatch in size
             
-    return sorted(matches, key=lambda x: x['Score'], reverse=True)
+        if score > 0.2: # Only keep decent matches
+            results.append({**buyer, "Score": round(score * 100, 1)})
+            
+    return sorted(results, key=lambda x: x['Score'], reverse=True)
 
-# --- THE APP UI ---
+# --- UI LAYOUT ---
 
-# Sidebar
 with st.sidebar:
-    st.header("⚙️ Settings")
-    api_key = st.text_input("OpenAI API Key", type="password", help="Leave empty to use Demo Mode")
-    st.info("💡 **Demo Mode Active:** running without real AI for preview purposes.")
+    st.header("🔑 API Setup")
+    gemini_key = st.text_input("Google Gemini API Key", type="password", help="Get one at aistudio.google.com")
+    st.info("No key? The scraper will work, but the AI summary will fail.")
 
-st.title("🧩 M&A Deal Profiler")
-st.markdown("Enter a target company URL to find the perfect buyer.")
+st.title("🧩 M&A Profiler (Gemini Edition)")
+st.markdown("Enter a URL to scrape the business, analyze it with Google Gemini, and find buyers.")
 
 # STEP 1: INPUT
-st.subheader("1. Target Analysis")
 col1, col2 = st.columns([3, 1])
 with col1:
-    url = st.text_input("Company URL", placeholder="www.dentalsolutions.com")
+    url_input = st.text_input("Company URL", placeholder="www.example.com")
 
-if url:
-    with st.spinner("🕷️ Scraping website and analyzing business model..."):
-        # In real version, we scrape here. In demo, we mock it.
-        summary = mock_ai_analysis(url)
-    
-    st.success("Analysis Complete")
-    st.text_area("AI Business Summary", value=summary, height=80)
-    
-    st.divider()
-    
-    # STEP 2: PROFILING
-    st.subheader("2. Deal Structuring")
-    with st.form("profiler"):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            revenue = st.selectbox("Revenue", ["<$1M", "$1M-$5M", "$5M-$20M", "$20M+"])
-        with c2:
-            deal_goal = st.selectbox("Goal", ["Full Exit", "Majority Recap", "Growth Capital"])
-        with c3:
-            timeline = st.selectbox("Timeline", ["ASAP", "6 Months", "12+ Months"])
+if url_input:
+    if not gemini_key:
+        st.warning("Please enter your Gemini API Key in the sidebar to proceed.")
+    else:
+        with st.spinner("🕷️ Scraping & 🧠 Thinking (Gemini 1.5)..."):
+            # 1. Scrape
+            raw_text = scrape_website(url_input)
             
-        search_btn = st.form_submit_button("🔍 Find Acquirers")
-
-    # STEP 3: RESULTS
-    if search_btn:
-        st.divider()
-        st.subheader("3. Top Acquirer Matches")
-        
-        results = match_acquirers(revenue, deal_goal, summary)
-        
-        if not results:
-            st.warning("No high-confidence matches found in database.")
-        
-        for res in results:
-            with st.container():
-                # Card Layout
-                row1, row2 = st.columns([4, 1])
-                with row1:
-                    st.markdown(f"### **{res['Name']}** <span style='color:green; font-size:16px'>({res['Score']}% Match)</span>", unsafe_allow_html=True)
-                    st.write(f"**Focus:** {res['Focus']} | **Type:** {res['Type']}")
-                    st.caption(f"**Notable Buys:** {', '.join(res['Past_Buys'])}")
-                with row2:
-                    st.write("") # Spacer
-                    if st.button(f"📧 Draft Email", key=res['Name']):
-                        st.toast(f"Draft saved for {res['Name']}!")
-                st.markdown("---")
+            if raw_text:
+                # 2. Analyze with Gemini
+                analysis = analyze_with_gemini(gemini_key, raw_text)
+                st.success("Analysis Complete")
+                st.markdown(f"### 🤖 AI Assessment")
+                st.info(analysis)
+                
+                st.divider()
+                
+                # STEP 2: REFINE
+                st.subheader("Deal Context")
+                with st.form("deal_form"):
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        rev = st.selectbox("Annual Revenue", ["<$1M", "$1M - $5M", "$5M - $20M", "$20M+"])
+                    with c2:
+                        goal = st.selectbox("Deal Goal", ["Full Exit", "Majority Recap", "Growth Equity"])
+                        
+                    match_btn = st.form_submit_button("Find Buyers")
+                
+                # STEP 3: MATCHING
+                if match_btn:
+                    st.divider()
+                    st.subheader("Recommended Acquirers")
+                    matches = find_matches(analysis, goal, rev)
+                    
+                    for m in matches:
+                        with st.container():
+                            st.markdown(f"### {m['Name']} <span style='font-size:0.8em; color:green'>({m['Score']}% Fit)</span>", unsafe_allow_html=True)
+                            st.write(f"**Focus:** {m['Focus']}")
+                            st.write(f"**Type:** {m['Type']}")
+                            if st.button(f"Draft Outreach to {m['Name']}", key=m['Name']):
+                                st.toast("Draft saved to sequence!")
+                            st.markdown("---")
+            else:
+                st.error("Could not scrape that URL. Try another or check the link.")
